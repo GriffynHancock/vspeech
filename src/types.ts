@@ -39,6 +39,29 @@ export interface AppSettings {
   [key: string]: string | undefined;
 }
 
+// ── Wikipedia index ───────────────────────────────────────────────
+export interface IndexStatus {
+  status:   'missing' | 'demo' | 'partial' | 'ready';
+  articles: number;
+  level:    number | null;
+  date:     string | null;
+  checksum: string | null;
+  path:     string | null;
+}
+
+export interface WikiProgressEvent {
+  type:      string;
+  message?:  string;
+  done?:     number;
+  total?:    number;
+  percent?:  number;
+  phase?:    number;
+  articles?: number;
+  errors?:   number;
+  checksum?: string;
+}
+
+// ── WebSocket events ──────────────────────────────────────────────
 export type WSEvent =
   | { type: 'message_update';        message: Message;          conversation_id?: string }
   | { type: 'new_message';           message: Message;          conversation_id: string; contact: Contact; corpus_fingerprint?: string }
@@ -47,4 +70,7 @@ export type WSEvent =
   | { type: 'conversation_update';   conversation: Conversation }
   | { type: 'friend_request';        request: FriendRequest }
   | { type: 'friend_request_update'; requestId: string; status: string }
-  | { type: 'contacts_changed' };
+  | { type: 'contacts_changed' }
+  | { type: 'wiki_index_started';    level: number }
+  | { type: 'wiki_index_progress';   [key: string]: unknown }
+  | { type: 'wiki_index_finished';   exitCode: number; status: IndexStatus };

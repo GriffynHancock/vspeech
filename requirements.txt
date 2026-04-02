@@ -1,0 +1,6 @@
+# VectorSpeech Python dependencies
+# Install with: pip install -r requirements.txt
+# Or inside a venv: ./venv/bin/pip install -r requirements.txt
+
+sentencepiece>=0.2.0
+requests>=2.31.0

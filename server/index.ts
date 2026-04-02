@@ -1,4 +1,4 @@
-import { Elysia, t } from 'elysia';
+import { Elysia, t, error as elysiaError } from 'elysia';
 import { staticPlugin } from '@elysiajs/static';
 import { cors } from '@elysiajs/cors';
 import os   from 'os';
@@ -8,15 +8,17 @@ import * as db from './db';
 import { encodeMessage, decodeMessage, checkEngine } from './crypto';
 import { buildUrlCorpus, buildLocalCorpus }          from './corpus';
 import { log } from './logger';
-import { isSetup, setupPassword, verifyPassword, getSessionKey, invalidateSession } from './auth';
+import { isSetup, setupPassword, verifyPassword, getSessionKey, invalidateSession, sessionCount } from './auth';
 
 // ─────────────────────────────────────────────
-// WebSocket
+// WebSocket broadcast
 // ─────────────────────────────────────────────
 const wsClients = new Set<any>();
 function broadcast(event: object) {
   const p = JSON.stringify(event);
-  for (const ws of wsClients) { try { ws.send(p); } catch { wsClients.delete(ws); } }
+  for (const ws of wsClients) {
+    try { ws.send(p); } catch { wsClients.delete(ws); }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -31,19 +33,48 @@ function getMyIp(): string {
   return '127.0.0.1';
 }
 
-/** The IP we advertise to peers — user-configurable, falls back to auto-detect */
 function getAdvertisedIp(): string {
   return db.getSetting('public_ip') || getMyIp();
 }
 
 function tokenFromRequest(req: Request): string {
-  return req.headers.get('x-session-token') ?? '';
+  // Support both header formats for resilience
+  return (
+    req.headers.get('x-session-token') ??
+    req.headers.get('X-Session-Token') ??
+    ''
+  );
 }
-function requireAuth(request: Request): Response | null {
-  const key = getSessionKey(tokenFromRequest(request));
-  if (!key) return new Response(JSON.stringify({ error: 'Unauthenticated' }), { status: 401 });
+
+/**
+ * Auth guard — returns { error, status } on failure, null on success.
+ * NOTE: In Elysia 1.x, returning a plain Response from a handler can be
+ * swallowed. We instead return a typed error descriptor and let callers
+ * use it with elysiaError() or a plain-object 401.
+ */
+function requireAuth(request: Request): { ok: false; status: 401; body: { error: string } } | null {
+  const token = tokenFromRequest(request);
+  if (!token) {
+    log.warn('auth:missing-token', { path: new URL(request.url).pathname });
+    return { ok: false, status: 401, body: { error: 'Unauthenticated' } };
+  }
+  const key = getSessionKey(token);
+  if (!key) {
+    log.warn('auth:invalid-token', { path: new URL(request.url).pathname });
+    return { ok: false, status: 401, body: { error: 'Session expired — please log in again' } };
+  }
   db.setEncryptionKey(key);
   return null;
+}
+
+// Elysia-compatible guard (use inside handlers)
+function guard(request: Request, set: any): boolean {
+  const failure = requireAuth(request);
+  if (failure) {
+    set.status = 401;
+    return false;
+  }
+  return true;
 }
 
 const PORT    = Number(process.env.PORT ?? 3000);
@@ -52,22 +83,17 @@ const TEMP_DIR = path.join(process.cwd(), 'temp');
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 // ─────────────────────────────────────────────
-// Corpus cache — write corpus to temp file, reuse within same iteration
+// Corpus cache
 // ─────────────────────────────────────────────
-interface CachedCorpus { file: string; fingerprint: string }
-const corpusCache = new Map<string, CachedCorpus>(); // key: `${convId}:${iteration}`
-
-async function getCorpusFile(
-  convo: any,
-  hashValue: Buffer,
-): Promise<{ file: string | null; fingerprint: string | null }> {
+async function getCorpusFile(convo: any, hashValue: Buffer)
+  : Promise<{ file: string | null; fingerprint: string | null }> {
   if (!convo.corpus_type || convo.corpus_type === 'wikipedia') return { file: null, fingerprint: null };
 
-  const security    = convo.security_level ?? 'medium';
-  const presetsNum  = { low: 5, medium: 10, high: 20 } as Record<string, number>;
-  const presetsWords = { low: 80, medium: 100, high: 150 } as Record<string, number>;
-  const numFiles    = presetsNum[security]   ?? 10;
-  const wordsPerFile = presetsWords[security] ?? 100;
+  const security      = convo.security_level ?? 'medium';
+  const presetsNum    = { low: 5, medium: 10, high: 20 } as Record<string, number>;
+  const presetsWords  = { low: 80, medium: 100, high: 150 } as Record<string, number>;
+  const numFiles      = presetsNum[security]   ?? 10;
+  const wordsPerFile  = presetsWords[security] ?? 100;
 
   let result;
   if (convo.corpus_type === 'url') {
@@ -76,26 +102,22 @@ async function getCorpusFile(
     result = buildLocalCorpus(convo.corpus_source, hashValue, numFiles, wordsPerFile);
   }
 
-  // Write corpus to a temp file for the Python engine
   const tmpFile = path.join(TEMP_DIR, `corpus_custom_${Date.now()}.txt`);
   fs.writeFileSync(tmpFile, result.text, 'utf8');
-
   return { file: tmpFile, fingerprint: result.fingerprint };
 }
 
 // ─────────────────────────────────────────────
-// Async workflows
+// Async encode/decode workflows
 // ─────────────────────────────────────────────
 async function encodeAndSend(msgId: string, text: string, convo: any, contact: any, sentIteration: number) {
   log.info('encode:start', { msgId, sentIteration, corpusType: convo.corpus_type });
   let corpusFile: string | null = null;
-  let corpusFp:   string | null = null;
 
   try {
     db.updateMessage(msgId, { status: 'encoding' });
     broadcast({ type: 'message_update', message: db.getMessage(msgId) });
 
-    // Generate hash for this iteration (used for corpus selection)
     const crypto_ = await import('node:crypto');
     const seed    = convo.current_key;
     let   hash    = crypto_.createHash('sha256').update(seed).digest();
@@ -103,7 +125,7 @@ async function encodeAndSend(msgId: string, text: string, convo: any, contact: a
       hash = crypto_.createHash('sha256').update(seed + hash.toString('hex')).digest();
     }
 
-    // Build custom corpus if needed
+    let corpusFp: string | null = null;
     ({ file: corpusFile, fingerprint: corpusFp } = await getCorpusFile(convo, hash));
 
     const result = await encodeMessage(text, convo.current_key, sentIteration, convo.security_level, corpusFile);
@@ -112,19 +134,18 @@ async function encodeAndSend(msgId: string, text: string, convo: any, contact: a
     db.updateMessage(msgId, { token_vector: JSON.stringify(result.vector), status: 'sending' });
     broadcast({ type: 'message_update', message: db.getMessage(msgId) });
 
-    // P2P payload — NOTE: iteration is NOT sent (security: receiver uses own counter)
     const peerUrl = `http://${contact.ip}:${contact.port}/api/p2p/receive`;
     const res = await fetch(peerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        vector:           result.vector,
-        security_level:   convo.security_level,
-        corpus_type:      convo.corpus_type   ?? 'wikipedia',
-        corpus_source:    convo.corpus_source ?? '',
+        vector:             result.vector,
+        security_level:     convo.security_level,
+        corpus_type:        convo.corpus_type   ?? 'wikipedia',
+        corpus_source:      convo.corpus_source ?? '',
         corpus_fingerprint: corpusFp ?? '',
-        from_ip:          getAdvertisedIp(),   // user-configurable — fixes Tailscale routing
-        from_port:        PORT,
+        from_ip:            getAdvertisedIp(),
+        from_port:          PORT,
       }),
       signal: AbortSignal.timeout(20_000),
     });
@@ -137,7 +158,6 @@ async function encodeAndSend(msgId: string, text: string, convo: any, contact: a
     db.updateMessage(msgId, { status: 'failed', error_message: err?.message ?? String(err) });
     broadcast({ type: 'message_update', message: db.getMessage(msgId) });
   } finally {
-    // Clean up temp corpus file
     if (corpusFile) { try { fs.unlinkSync(corpusFile); } catch { /* ok */ } }
   }
 }
@@ -171,7 +191,6 @@ async function decodeAsync(
 
     const plaintext = await decodeMessage(vector, key, recvIteration, security, corpusFile);
     log.info('decode:done', { msgId, chars: plaintext.length });
-
     db.updateMessage(msgId, { plaintext, status: 'decoded' });
     broadcast({ type: 'message_update', message: db.getMessage(msgId) });
   } catch (err: any) {
@@ -184,6 +203,36 @@ async function decodeAsync(
 }
 
 // ─────────────────────────────────────────────
+// Wiki index helpers
+// ─────────────────────────────────────────────
+function getIndexStatus() {
+  const candidates = [
+    { level: 4, path: path.join(process.cwd(), 'vital_articles_v4.json') },
+    { level: 3, path: path.join(process.cwd(), 'vital_articles_v3.json') },
+    { level: 1, path: path.join(process.cwd(), 'vital_articles_v1.json') },
+    { level: 4, path: path.join(process.cwd(), 'vital_articles_demo.json') },
+  ];
+
+  for (const { level, path: p } of candidates) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const meta = data.metadata ?? {};
+      const n    = (data.index ?? []).length;
+      const isDemo    = p.includes('demo');
+      const isPartial = meta.partial === true;
+      const status    = isDemo ? 'demo' : isPartial ? 'partial' : n > 0 ? 'ready' : 'missing';
+      return { status, path: p, articles: n, level: meta.version ?? level,
+               date: meta.snapshot_date ?? null, checksum: meta.checksum ?? null };
+    } catch { continue; }
+  }
+  return { status: 'missing', path: null, articles: 0, level: null, date: null, checksum: null };
+}
+
+let buildProcess: ReturnType<typeof Bun.spawn> | null = null;
+let buildAborted = false;
+
+// ─────────────────────────────────────────────
 // App
 // ─────────────────────────────────────────────
 const app = new Elysia();
@@ -191,8 +240,16 @@ const app = new Elysia();
 if (IS_PROD) {
   app.use(staticPlugin({ assets: path.join(process.cwd(), 'dist'), prefix: '/' }));
 }
-app.use(cors({ origin: true }));
-app.onRequest(({ request }) => log.debug(`→ ${request.method} ${new URL(request.url).pathname}`));
+
+app.use(cors({
+  origin: true,
+  // Explicitly allow our custom auth header
+  allowedHeaders: ['Content-Type', 'X-Session-Token', 'x-session-token'],
+}));
+
+app.onRequest(({ request }) =>
+  log.debug(`→ ${request.method} ${new URL(request.url).pathname}`)
+);
 
 // ── WebSocket ──
 app.ws('/ws', {
@@ -202,46 +259,69 @@ app.ws('/ws', {
 });
 
 // ── Auth ──
-app.get('/api/auth/status', () => ({ setup: isSetup() }));
+app.get('/api/auth/status', () => ({
+  setup:    isSetup(),
+  sessions: sessionCount(),
+}));
 
 app.post('/api/auth/setup',
-  ({ body }) => {
-    if (isSetup()) return new Response(JSON.stringify({ error: 'Already set up' }), { status: 409 });
+  ({ body, set }) => {
+    if (isSetup()) {
+      set.status = 409;
+      return { error: 'Already set up — use /api/auth/login' };
+    }
     try {
       setupPassword((body as any).password);
       const token = verifyPassword((body as any).password)!;
       db.setEncryptionKey(getSessionKey(token)!);
+      log.info('auth:setup-complete');
       return { token };
-    } catch (e: any) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
+    } catch (e: any) {
+      set.status = 400;
+      return { error: e.message };
+    }
   },
   { body: t.Object({ password: t.String({ minLength: 8 }) }) }
 );
 
 app.post('/api/auth/login',
-  ({ body }) => {
+  ({ body, set }) => {
     const token = verifyPassword((body as any).password);
-    if (!token) return new Response(JSON.stringify({ error: 'Incorrect password' }), { status: 401 });
+    if (!token) {
+      set.status = 401;
+      return { error: 'Incorrect password' };
+    }
     db.setEncryptionKey(getSessionKey(token)!);
+    log.info('auth:login-ok');
     return { token };
   },
   { body: t.Object({ password: t.String() }) }
 );
 
-app.post('/api/auth/logout', ({ request }) => {
-  invalidateSession(tokenFromRequest(request));
+app.post('/api/auth/logout', ({ request, set }) => {
+  const token = tokenFromRequest(request);
+  if (token) invalidateSession(token);
   db.clearEncryptionKey();
   return { ok: true };
 });
 
-// ── Settings (my public IP, display name, etc.) ──
-app.get('/api/settings', ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+// Session probe — lets the frontend check if its token is still valid
+// without triggering a full data load
+app.get('/api/auth/check', ({ request, set }) => {
+  const failure = requireAuth(request);
+  if (failure) { set.status = 401; return failure.body; }
+  return { ok: true, sessions: sessionCount() };
+});
+
+// ── Settings ──
+app.get('/api/settings', ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return db.getAllSettings();
 });
 
 app.put('/api/settings',
-  ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  ({ body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     for (const [k, v] of Object.entries(body as Record<string, string>)) {
       db.setSetting(k, String(v));
     }
@@ -252,8 +332,8 @@ app.put('/api/settings',
 );
 
 // ── System ──
-app.get('/api/system', async ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/system', async ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   const engine = await checkEngine();
   return {
     myIp:         getMyIp(),
@@ -262,28 +342,29 @@ app.get('/api/system', async ({ request }) => {
     engine,
     version:      '1.0.0',
     logFile:      log.filePath,
+    wikiIndex:    getIndexStatus(),
   };
 });
 
 // ── Contacts ──
-app.get('/api/contacts', ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/contacts', ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return db.getContacts();
 });
 
 app.post('/api/contacts',
-  ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  ({ body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const existing = db.getContactByIp((body as any).ip);
-    if (existing) return new Response(JSON.stringify({ error: 'IP already exists' }), { status: 409 });
+    if (existing) { set.status = 409; return { error: 'IP already exists' }; }
     return db.addContact(body as any);
   },
   { body: t.Object({ name: t.String({ minLength: 1 }), ip: t.String({ minLength: 7 }), port: t.Optional(t.Number()) }) }
 );
 
 app.patch('/api/contacts/:id',
-  ({ params, body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  ({ params, body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const updated = db.updateContact(params.id, body as any);
     broadcast({ type: 'contact_update', contact: updated });
     return updated;
@@ -291,21 +372,21 @@ app.patch('/api/contacts/:id',
   { body: t.Object({ name: t.Optional(t.String()), ip: t.Optional(t.String()), port: t.Optional(t.Number()) }) }
 );
 
-app.delete('/api/contacts/:id', ({ params, request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.delete('/api/contacts/:id', ({ params, request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   db.deleteContact(params.id);
   return { ok: true };
 });
 
 // ── Conversations ──
-app.get('/api/contacts/:contactId/conversation', ({ params, request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/contacts/:contactId/conversation', ({ params, request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return db.getOrCreateConversation(params.contactId);
 });
 
 app.put('/api/conversations/:id/key',
-  ({ params, body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  ({ params, body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     db.updateConversationKey(params.id, (body as any).key);
     broadcast({ type: 'conversation_update', conversation: db.getConversation(params.id) });
     return db.getConversation(params.id);
@@ -314,8 +395,8 @@ app.put('/api/conversations/:id/key',
 );
 
 app.put('/api/conversations/:id/security',
-  ({ params, body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  ({ params, body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     db.updateConversationSecurity(params.id, (body as any).level);
     return db.getConversation(params.id);
   },
@@ -323,30 +404,30 @@ app.put('/api/conversations/:id/security',
 );
 
 app.put('/api/conversations/:id/corpus',
-  async ({ params, body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  async ({ params, body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const { corpus_type, corpus_source } = body as any;
 
-    // Validate URL-based corpus by fetching its file list
     let fingerprint = '';
     if (corpus_type === 'url' && corpus_source) {
       try {
         const { buildUrlCorpus } = await import('./corpus');
-        // Quick fingerprint check: fetch list only
         const dummyHash = Buffer.alloc(32, 0);
         const r = await buildUrlCorpus(corpus_source, dummyHash, 1, 10);
         fingerprint = r.fingerprint;
       } catch (e: any) {
-        return new Response(JSON.stringify({ error: `Corpus URL error: ${e.message}` }), { status: 400 });
+        set.status = 400;
+        return { error: `Corpus URL error: ${e.message}` };
       }
     } else if (corpus_type === 'local' && corpus_source) {
-      const { buildLocalCorpus } = await import('./corpus');
       try {
+        const { buildLocalCorpus } = await import('./corpus');
         const dummyHash = Buffer.alloc(32, 0);
         const r = buildLocalCorpus(corpus_source, dummyHash, 1, 10);
         fingerprint = r.fingerprint;
       } catch (e: any) {
-        return new Response(JSON.stringify({ error: `Corpus path error: ${e.message}` }), { status: 400 });
+        set.status = 400;
+        return { error: `Corpus path error: ${e.message}` };
       }
     }
 
@@ -357,26 +438,25 @@ app.put('/api/conversations/:id/corpus',
 );
 
 // ── Messages ──
-app.get('/api/conversations/:id/messages', ({ params, request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/conversations/:id/messages', ({ params, request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return db.getMessages(params.id);
 });
 
-app.get('/api/conversations/:id/message-count', ({ params, request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/conversations/:id/message-count', ({ params, request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return { count: db.getMessageCount(params.id) };
 });
 
 app.post('/api/messages/send',
-  async ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  async ({ body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const { conversation_id, text } = body as any;
     const convo = db.getConversation(conversation_id);
-    if (!convo)            return new Response(JSON.stringify({ error: 'Conversation not found' }), { status: 404 });
-    if (!convo.current_key) return new Response(JSON.stringify({ error: 'No key set' }),            { status: 400 });
+    if (!convo)             { set.status = 404; return { error: 'Conversation not found' }; }
+    if (!convo.current_key) { set.status = 400; return { error: 'No key set for this conversation' }; }
 
     const contact      = db.getContact(convo.contact_id);
-    // Use SENT counter — not transmitted to peer
     const sentIteration = db.consumeSentIteration(conversation_id);
 
     const msg = db.addMessage({
@@ -393,12 +473,12 @@ app.post('/api/messages/send',
 );
 
 app.post('/api/messages/reprocess',
-  async ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  async ({ body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const { message_ids, conversation_id } = body as any;
     const convo = db.getConversation(conversation_id);
-    if (!convo)             return new Response(JSON.stringify({ error: 'Conversation not found' }), { status: 404 });
-    if (!convo.current_key) return new Response(JSON.stringify({ error: 'No key set' }),             { status: 400 });
+    if (!convo)             { set.status = 404; return { error: 'Conversation not found' }; }
+    if (!convo.current_key) { set.status = 400; return { error: 'No key set' }; }
 
     let queued = 0;
     for (const id of message_ids) {
@@ -414,20 +494,18 @@ app.post('/api/messages/reprocess',
 );
 
 // ── Friend requests ──
-app.get('/api/friend-requests', ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.get('/api/friend-requests', ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return db.getPendingFriendRequests();
 });
 
 app.post('/api/friend-requests/:requestId/accept',
-  async ({ params, body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  async ({ params, body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     const fr = db.getFriendRequest(params.requestId);
-    if (!fr) return new Response(JSON.stringify({ error: 'Request not found' }), { status: 404 });
+    if (!fr) { set.status = 404; return { error: 'Request not found' }; }
 
     const displayName = (body as any).display_name || fr.from_name;
-
-    // Create contact using the preferred IP from the request
     const existing = db.getContactByIp(fr.from_ip);
     if (!existing) {
       db.addContact({ name: displayName, ip: fr.from_ip, port: fr.from_port });
@@ -435,16 +513,15 @@ app.post('/api/friend-requests/:requestId/accept',
 
     db.updateFriendRequestStatus(params.requestId, 'accepted');
 
-    // Send acceptance back to requester
     try {
       await fetch(`http://${fr.from_ip}:${fr.from_port}/api/p2p/friend-accepted`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          request_id:   params.requestId,
-          my_name:      db.getSetting('display_name') || 'VectorSpeech User',
-          my_ip:        getAdvertisedIp(),
-          my_port:      PORT,
+          request_id: params.requestId,
+          my_name:    db.getSetting('display_name') || 'VectorSpeech User',
+          my_ip:      getAdvertisedIp(),
+          my_port:    PORT,
         }),
         signal: AbortSignal.timeout(10_000),
       });
@@ -459,14 +536,57 @@ app.post('/api/friend-requests/:requestId/accept',
   { body: t.Object({ display_name: t.Optional(t.String()) }) }
 );
 
-app.post('/api/friend-requests/:requestId/reject', ({ params, request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.post('/api/friend-requests/:requestId/reject', ({ params, request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   db.updateFriendRequestStatus(params.requestId, 'rejected');
   broadcast({ type: 'friend_request_update', requestId: params.requestId, status: 'rejected' });
   return { ok: true };
 });
 
-// ── P2P receive (no auth — peer machines call this) ──
+// ── Friend request send (OUTBOUND — requires auth) ──
+app.post('/api/friend-requests/send',
+  async ({ body, request, set }) => {
+    // Auth check first — this was the source of the "Unauthenticated" bug
+    // when sessions expired after server restart
+    const f = requireAuth(request);
+    if (f) {
+      log.warn('friend-request:send:unauthenticated');
+      set.status = 401;
+      return f.body;
+    }
+
+    const { target_ip, target_port } = body as any;
+    const requestId  = (await import('node:crypto')).randomUUID();
+    const myName     = db.getSetting('display_name') || 'VectorSpeech User';
+    const myIp       = getAdvertisedIp();
+
+    log.info('friend-request:sending', { to: target_ip, port: target_port, myIp });
+
+    try {
+      const res = await fetch(`http://${target_ip}:${target_port ?? 3000}/api/p2p/friend-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          request_id: requestId,
+          from_name:  myName,
+          from_ip:    myIp,
+          from_port:  PORT,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`Peer returned ${res.status}`);
+      log.info('friend-request:sent', { to: target_ip, requestId });
+      return { ok: true, request_id: requestId };
+    } catch (e: any) {
+      log.warn('friend-request:send-failed', { to: target_ip, err: e.message });
+      set.status = 502;
+      return { error: `Could not reach ${target_ip}:${target_port ?? 3000} — ${e.message}` };
+    }
+  },
+  { body: t.Object({ target_ip: t.String(), target_port: t.Optional(t.Number()) }) }
+);
+
+// ── P2P inbound receive (no auth — called by peer machines) ──
 app.post('/api/p2p/receive',
   async ({ body, request }) => {
     const {
@@ -486,11 +606,8 @@ app.post('/api/p2p/receive',
     }
 
     const convo = db.getOrCreateConversation(contact.id);
-
-    // Use RECV counter — not sent by peer; stays in sync if no messages are dropped
     const recvIteration = db.consumeRecvIteration(convo.id);
 
-    // Inherit corpus settings from the peer's payload (so both sides agree)
     const effectiveCorpusType   = corpus_type   || convo.corpus_type   || 'wikipedia';
     const effectiveCorpusSource = corpus_source || convo.corpus_source || '';
     if (effectiveCorpusType !== convo.corpus_type || effectiveCorpusSource !== convo.corpus_source) {
@@ -526,7 +643,7 @@ app.post('/api/p2p/receive',
   }) }
 );
 
-// ── P2P friend request (receive a request from a peer) ──
+// ── P2P friend request inbound ──
 app.post('/api/p2p/friend-request',
   ({ body }) => {
     const { request_id, from_name, from_ip, from_port } = body as any;
@@ -546,8 +663,6 @@ app.post('/api/p2p/friend-accepted',
   ({ body }) => {
     const { request_id, my_name, my_ip, my_port } = body as any;
     log.info('p2p:friend-accepted', { from: my_ip, name: my_name });
-
-    // Create contact with the peer's preferred IP
     const existing = db.getContactByIp(my_ip);
     if (!existing) {
       const contact = db.addContact({ name: my_name, ip: my_ip, port: my_port ?? 3000 });
@@ -562,97 +677,18 @@ app.post('/api/p2p/friend-accepted',
   }) }
 );
 
-// ── Friend request outbound (initiate) ──
-app.post('/api/friend-requests/send',
-  async ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
-    const { target_ip, target_port } = body as any;
-
-    const requestId  = (await import('node:crypto')).randomUUID();
-    const myName     = db.getSetting('display_name') || 'VectorSpeech User';
-    const myIp       = getAdvertisedIp();
-
-    try {
-      const res = await fetch(`http://${target_ip}:${target_port ?? 3000}/api/p2p/friend-request`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          request_id: requestId,
-          from_name:  myName,
-          from_ip:    myIp,
-          from_port:  PORT,
-        }),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) throw new Error(`Peer returned ${res.status}`);
-      log.info('friend-request:sent', { to: target_ip, requestId });
-      return { ok: true, request_id: requestId };
-    } catch (e: any) {
-      log.warn('friend-request:send-failed', { to: target_ip, err: e.message });
-      return new Response(JSON.stringify({ error: `Could not reach ${target_ip}: ${e.message}` }), { status: 502 });
-    }
-  },
-  { body: t.Object({ target_ip: t.String(), target_port: t.Optional(t.Number()) }) }
-);
-
-// ─────────────────────────────────────────────
-// Wikipedia index management
-// ─────────────────────────────────────────────
-
-/** Return status of the Wikipedia index file(s) */
-function getIndexStatus(): {
-  status: 'missing' | 'demo' | 'partial' | 'ready';
-  path: string | null;
-  articles: number;
-  level: number | null;
-  date: string | null;
-  checksum: string | null;
-} {
-  const candidates = [
-    { level: 4, path: path.join(process.cwd(), 'vital_articles_v4.json') },
-    { level: 3, path: path.join(process.cwd(), 'vital_articles_v3.json') },
-    { level: 1, path: path.join(process.cwd(), 'vital_articles_v1.json') },
-    { level: 4, path: path.join(process.cwd(), 'vital_articles_demo.json') },
-  ];
-
-  for (const { level, path: p } of candidates) {
-    if (!fs.existsSync(p)) continue;
-    try {
-      const raw  = fs.readFileSync(p, 'utf8');
-      const data = JSON.parse(raw);
-      const meta = data.metadata ?? {};
-      const n    = (data.index ?? []).length;
-      const isDemo    = p.includes('demo');
-      const isPartial = meta.partial === true;
-      const status    = isDemo ? 'demo' : isPartial ? 'partial' : n > 0 ? 'ready' : 'missing';
-      return {
-        status,
-        path:     p,
-        articles: n,
-        level:    meta.version ?? level,
-        date:     meta.snapshot_date ?? null,
-        checksum: meta.checksum ?? null,
-      };
-    } catch { continue; }
-  }
-  return { status: 'missing', path: null, articles: 0, level: null, date: null, checksum: null };
-}
-
-app.get('/api/wiki-index/status', ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+// ── Wiki index management ──
+app.get('/api/wiki-index/status', ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   return getIndexStatus();
 });
 
-// Active build process (only one at a time)
-let buildProcess: ReturnType<typeof Bun.spawn> | null = null;
-let buildLevel   = 4;
-let buildAborted = false;
-
 app.post('/api/wiki-index/build',
-  async ({ body, request }) => {
-    const g = requireAuth(request); if (g) return g;
+  async ({ body, request, set }) => {
+    const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
     if (buildProcess) {
-      return new Response(JSON.stringify({ error: 'A build is already running' }), { status: 409 });
+      set.status = 409;
+      return { error: 'A build is already running' };
     }
 
     const level   = (body as any).level ?? 4;
@@ -662,35 +698,28 @@ app.post('/api/wiki-index/build',
     const script  = path.join(process.cwd(), 'build_wiki_index.py');
 
     if (!fs.existsSync(script)) {
-      return new Response(JSON.stringify({ error: 'build_wiki_index.py not found in project root' }), { status: 404 });
+      set.status = 404;
+      return { error: 'build_wiki_index.py not found in project root' };
     }
 
     log.info('wiki-index:build:start', { level, resume, out: outFile });
-    buildLevel   = level;
     buildAborted = false;
 
     const args = [
-      script,
-      '--level',         String(level),
-      '--out',           outFile,
-      '--progress-json',
+      script, '--level', String(level), '--out', outFile, '--progress-json',
       ...(resume ? ['--resume'] : []),
     ];
 
     buildProcess = Bun.spawn([pyBin, ...args], {
-      cwd:    process.cwd(),
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env:    { ...process.env },
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe', env: { ...process.env },
     });
 
     broadcast({ type: 'wiki_index_started', level });
 
-    // Stream progress lines from the Python script to all WS clients
     ;(async () => {
       const reader = buildProcess!.stdout.getReader();
-      const dec    = new TextDecoder();
-      let   buf    = '';
+      const dec = new TextDecoder();
+      let buf = '';
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -704,12 +733,9 @@ app.post('/api/wiki-index/build',
             try {
               const parsed = JSON.parse(trimmed);
               broadcast({ type: 'wiki_index_progress', ...parsed });
-              if (parsed.type === 'done') {
-                log.info('wiki-index:build:done', { articles: parsed.articles });
-              }
+              if (parsed.type === 'done') log.info('wiki-index:build:done', { articles: parsed.articles });
             } catch {
-              // Plain text line — wrap it
-              broadcast({ type: 'wiki_index_progress', type_: 'info', message: trimmed });
+              broadcast({ type: 'wiki_index_progress', type: 'info', message: trimmed });
             }
           }
         }
@@ -717,9 +743,7 @@ app.post('/api/wiki-index/build',
         const exitCode = await buildProcess!.exited;
         buildProcess   = null;
         broadcast({ type: 'wiki_index_finished', exitCode, status: getIndexStatus() });
-        if (exitCode !== 0 && !buildAborted) {
-          log.warn('wiki-index:build:failed', { exitCode });
-        }
+        if (exitCode !== 0 && !buildAborted) log.warn('wiki-index:build:failed', { exitCode });
       }
     })();
 
@@ -728,8 +752,8 @@ app.post('/api/wiki-index/build',
   { body: t.Object({ level: t.Optional(t.Number()), resume: t.Optional(t.Boolean()) }) }
 );
 
-app.post('/api/wiki-index/cancel', ({ request }) => {
-  const g = requireAuth(request); if (g) return g;
+app.post('/api/wiki-index/cancel', ({ request, set }) => {
+  const f = requireAuth(request); if (f) { set.status = 401; return f.body; }
   if (buildProcess) {
     buildAborted = true;
     buildProcess.kill('SIGTERM');
@@ -740,7 +764,7 @@ app.post('/api/wiki-index/cancel', ({ request }) => {
   return { ok: false, message: 'No build running' };
 });
 
-// ── SPA fallback ──
+// ── SPA fallback (production) ──
 if (IS_PROD) {
   app.get('/*', ({ set }) => {
     set.headers['content-type'] = 'text/html';
@@ -753,4 +777,5 @@ log.info('server:start', { port: PORT, ip: getMyIp(), advertised: getAdvertisedI
 console.log(`\n🔐 VectorSpeech Chat  →  http://localhost:${PORT}`);
 console.log(`   LAN / VPN address  →  http://${getAdvertisedIp()}:${PORT}`);
 console.log(`   P2P endpoint       →  http://${getAdvertisedIp()}:${PORT}/api/p2p/receive`);
-console.log(`   Log file           →  ${log.filePath}\n`);
+console.log(`   Log file           →  ${log.filePath}`);
+console.log(`   Reset tool         →  ./reset.sh\n`);

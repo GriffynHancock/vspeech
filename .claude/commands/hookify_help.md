@@ -1,0 +1,1 @@
+/Users/gaura/claude-plugins-official/plugins/hookify/commands/help.md

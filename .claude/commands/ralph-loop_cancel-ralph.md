@@ -1,0 +1,1 @@
+/Users/gaura/claude-plugins-official/plugins/ralph-loop/commands/cancel-ralph.md
