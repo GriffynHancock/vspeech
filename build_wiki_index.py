@@ -109,9 +109,43 @@ def api_get(params: dict, retries: int = 5) -> dict:
 
 def iter_category_members(page_title: str) -> Iterator[str]:
     """Yield all article titles in a Wikipedia category page (using its wikilinks)."""
-    # Strategy: parse the vital articles list page directly — more reliable than
-    # the category API which misses subcategories. We fetch the page wikitext,
-    # extract all internal links that look like article titles (not Talk: etc.).
+    # Strategy: Vital Articles Level 4+ are split across multiple subpages.
+    # First, we enumerate all subpages, then extract article links from each.
+    import re
+    seen: set[str] = set()
+
+    # Determine if this is a Level 4/5 page (has subpages)
+    if "Level 4" in page_title or "Level 5" in page_title or "Level/4" in page_title or "Level/5" in page_title:
+        # Get all subpages
+        base_prefix = page_title.replace("Wikipedia:", "").replace(" ", "_")
+        params = {
+            "action":      "query",
+            "list":        "allpages",
+            "apprefix":    f"{base_prefix}/",
+            "apnamespace": "4",  # Wikipedia namespace
+            "aplimit":     "500",
+        }
+        data = api_get(params)
+        subpages = [p["title"] for p in data.get("query", {}).get("allpages", [])]
+
+        # Filter out non-list subpages (talk, archive, draft pages)
+        list_pages = [
+            sp for sp in subpages
+            if not any(x in sp.lower() for x in ["talk", "archive", "draft", "article alerts"])
+        ]
+
+        # Extract articles from each subpage
+        for sp in list_pages:
+            yield from _extract_articles_from_page(sp, seen)
+    else:
+        # Level 1-3: single page with all articles
+        yield from _extract_articles_from_page(page_title, seen)
+
+
+def _extract_articles_from_page(page_title: str, seen: set[str]) -> Iterator[str]:
+    """Extract article links from a single Wikipedia page."""
+    import re
+
     params = {
         "action":   "query",
         "prop":     "revisions",
@@ -129,13 +163,9 @@ def iter_category_members(page_title: str) -> Iterator[str]:
             content = revs[0].get("slots", {}).get("main", {}).get("*", "")
 
     if not content:
-        # Fallback to category API
-        yield from iter_category_api(page_title)
         return
 
     # Extract [[Article title]] links, skipping non-article namespaces
-    import re
-    seen: set[str] = set()
     skip_prefixes  = (
         "Wikipedia:", "WP:", "Talk:", "User:", "File:", "Image:",
         "Template:", "Help:", "Portal:", "Category:", "Special:",

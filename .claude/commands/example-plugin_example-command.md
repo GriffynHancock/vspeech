@@ -1,0 +1,1 @@
+/Users/gaura/claude-plugins-official/plugins/example-plugin/commands/example-command.md
