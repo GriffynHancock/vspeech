@@ -6,21 +6,6 @@ Messages are encrypted using one-time tokenisers trained on deterministically se
 pages. Neither the seed phrase nor the tokeniser models are ever transmitted — only opaque token
 vectors travel over the network.
 
-## Architecture
-
-```
-┌─────────────┐   WebSocket    ┌─────────────────────────────┐
-│  React SPA  │◄──────────────►│   Bun + Elysia API server   │
-│  (Vite)     │   REST /api    │                             │
-└─────────────┘                │  ┌─────────┐  ┌──────────┐ │
-                                │  │ SQLite  │  │  Python  │ │
-                                │  │ (WAL)   │  │ engine   │ │
-                                │  └─────────┘  └──────────┘ │
-                                │                             │
-                                │  POST /api/p2p/receive      │◄── peer instances
-                                └─────────────────────────────┘
-```
-
 ## Prerequisites
 
 | Tool | Version |
