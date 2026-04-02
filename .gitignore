@@ -1,0 +1,11 @@
+node_modules/
+.venv/
+venv/
+dist/
+temp/
+output/
+logs/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
